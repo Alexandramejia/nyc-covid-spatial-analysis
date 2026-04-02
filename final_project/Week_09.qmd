@@ -1,0 +1,315 @@
+---
+title: "NYC COVID Spatial Analysis"
+author: "Alexandra Mejia"
+date: "3/31/2026"
+format:
+  html:
+    toc: true
+    toc-location: left
+    code-fold: true
+    code-summary: "Show the code"
+    code-tools: true
+    embed-resources: true
+---
+## Introduction
+
+This project analyzes COVID-19 patterns across New York City zip codes by combining public health, demographic, and spatial datasets. The analysis joins ZIP code boundaries with COVID-19 case counts, food retail stores, nursing home locations, and ACS demographic data in order to explore how cases relate to population characteristics and local resources.
+
+```{r load_packages, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(sf)
+  library(mapview)
+  library(magrittr)
+  library(leaflet) 
+  library(ggspatial)
+  library(patchwork)
+})
+```
+
+## Data Sources 
+```{r}
+# ZIP Code 
+zip_code <- st_read("../Week_07/R-Spatial_I_Lab/ZIP_CODE_040114/ZIP_CODE_040114.shp")
+
+# Health facilities
+nys_health <- read_csv("../Week_08/R-Spatial_II_Lab/NYS_Health_Facility.csv", show_col_types = FALSE)
+
+# Food stores
+nys_food_store <- read_csv("../Week_07/R-Spatial_I_Lab/nys_retail_food_store_xy.csv",
+                           locale = locale(encoding = "Latin1"),
+                           show_col_types = FALSE)
+# COVID data
+covid19 <- read_csv("../Week_08/R-Spatial_II_Lab/tests-by-zcta_2020_04_12.csv", show_col_types = FALSE)
+
+# ACS population 
+acs <- readLines("../Week_08/R-Spatial_II_Lab/ACSDP5Y2018.DP05_data_with_overlays_2020-04-22T132935.csv")
+
+# NYC Planning Census Tract Data
+tracts <- st_read("../Week_08/R-Spatial_II_Lab/2010 Census Tracts/geo_export_1dc7b645-647b-4806-b9a0-7b79660f120a.shp",
+                  stringsAsFactors = FALSE)
+```
+
+## Data Cleaning 
+```{r}
+# Clean health data
+nys_health_clean <- nys_health %>%
+  filter(
+    !is.na(`Facility Longitude`),
+    !is.na(`Facility Latitude`),
+    `Facility Longitude` != 0,
+    `Facility Latitude` != 0
+  )
+
+# Clean food store data
+nys_food_store_clean <- nys_food_store %>%
+  filter(
+    !is.na(`X`),
+    !is.na(`Y`),
+    `X` != 0,
+    `Y` != 0,
+    `ï..County` %in% c("Bronx", "Kings", "New York", "Queens", "Richmond")
+  )
+```
+
+## Spatial Data Preparation
+```{r}
+nys_health_sf <- st_as_sf(nys_health_clean, coords = c("Facility Longitude", "Facility Latitude"), crs = 4326)
+
+nys_food_store_sf <- st_as_sf(nys_food_store_clean, coords = c("X", "Y"), crs = 4326)
+```
+
+## Data Joining and Aggregation 
+
+### COVID-19 data joined to ZIP code boundaries
+```{r}
+
+ nyc_sf_merged <- dplyr::left_join(zip_code %>% 
+                   dplyr::mutate(ZIPCODE=as.numeric(as.character(ZIPCODE))), 
+                 covid19, 
+                 by = c('ZIPCODE' = 'MODZCTA')) 
+
+names(nyc_sf_merged)
+```
+### Food retail store counts by ZIP code
+```{r}
+nys_food_store_sf <- st_transform(nys_food_store_sf, st_crs(nyc_sf_merged))
+
+food_store_count <- nys_food_store_sf %>% dplyr::filter(stringr::str_detect(Establishment.Type, 'JAC')) %>%
+  st_join(nyc_sf_merged, ., join= st_intersects) %>%
+  group_by(ZIPCODE) %>%
+  summarise(FOOD_STORE_COUNT = n())  %>%
+  st_set_geometry(NULL)
+
+food_store_merged <- dplyr::left_join(nyc_sf_merged, food_store_count, by = "ZIPCODE")
+
+names(food_store_merged)
+```
+### Nursing home counts by ZIP code
+```{r}
+nys_health_sf <- st_transform(nys_health_sf, st_crs(food_store_merged))
+
+facilities_count <- nys_health_sf %>% dplyr::filter(`Short Description` == "NH") %>%
+  sf::st_join(food_store_merged, ., join = st_intersects) %>%
+  dplyr::group_by(ZIPCODE) %>%
+  dplyr::summarise(NURSING_HOME_COUNT = n()) %>%
+  sf::st_set_geometry(NULL)
+
+facilities_merged <- dplyr::left_join(food_store_merged, facilities_count, by = "ZIPCODE")
+
+names(facilities_merged)
+```
+
+### ACS demographic processing
+```{r}
+
+tracts <- tracts %>%
+  dplyr::mutate(
+    cntyFIPS = dplyr::case_when(
+      boro_name == "Bronx" ~ "005",
+      boro_name == "Brooklyn" ~ "047",
+      boro_name == "Manhattan" ~ "061",
+      boro_name == "Queens" ~ "081",
+      boro_name == "Staten Island" ~ "085"
+    ),
+    tractFIPS = paste(cntyFIPS, ct2010, sep = "")
+  )
+
+acs <- acs %>%
+  magrittr::extract(-2) %>%
+  textConnection() %>%
+  read.csv(header = TRUE, quote = "\"") %>%
+  dplyr::select(
+    GEO_ID,
+    totPop = DP05_0001E,
+    elderlyPop = DP05_0024E,
+    malePop = DP05_0002E,
+    femalePop = DP05_0003E,
+    whitePop = DP05_0037E,
+    blackPop = DP05_0038E,
+    asianPop = DP05_0067E,
+    hispanicPop = DP05_0071E,
+    adultPop = DP05_0021E,
+    citizenAdult = DP05_0087E
+  ) %>%
+  dplyr::mutate(
+    censusCode = stringr::str_sub(GEO_ID, -9, -1)
+  )
+
+popData <- merge(tracts, acs, by.x = "tractFIPS", by.y = "censusCode")
+
+names(popData)
+sum(popData$totPop, na.rm = TRUE)
+```
+
+### ACS demographics aggregated to ZIP codes
+```{r}
+popNYC <- sf::st_transform(popData, st_crs(facilities_merged))
+
+joined_data <- sf::st_join(facilities_merged,
+                         popNYC %>% sf::st_centroid(),
+                         join = st_contains) %>%
+  dplyr::group_by(
+    ZIPCODE, PO_NAME, POPULATION, COUNTY,
+    Positive, Total, zcta_cum.perc_pos,
+    FOOD_STORE_COUNT, NURSING_HOME_COUNT
+  ) %>%
+  dplyr::summarise(
+    totPop = sum(totPop, na.rm = TRUE),
+    elderlyPop = sum(elderlyPop, na.rm = TRUE),
+    malePop = sum(malePop, na.rm = TRUE),
+    femalePop = sum(femalePop, na.rm = TRUE),
+    whitePop = sum(whitePop, na.rm = TRUE),
+    blackPop = sum(blackPop, na.rm = TRUE),
+    asianPop = sum(asianPop, na.rm = TRUE),
+    hispanicPop = sum(hispanicPop, na.rm = TRUE),
+    adultPop = sum(adultPop, na.rm = TRUE),
+    citizenAdult = sum(citizenAdult, na.rm = TRUE),
+    malePctg = sum(malePop, na.rm = TRUE) / sum(totPop, na.rm = TRUE) * 100
+  )
+
+names(joined_data)
+sum(joined_data$totPop, na.rm = TRUE)
+```
+## Final Mapping Dataset
+
+## Static Map of COVID-19 Cases
+```{r}
+positive_cases <- ggplot(joined_data)+
+  geom_sf(aes(fill=Positive)) + 
+  xlab("Longitude") + ylab("Latitude") +
+  ggtitle("New York City") + 
+  labs(fill = "COVID Cases") +
+  annotation_scale(location = "bl",
+                   width_hint = 0.2)+
+annotation_north_arrow(
+    location = "tr",
+    which_north = "true",
+    style = north_arrow_minimal)
+
+positive_cases
+```
+
+## Comparing COVID-19 Cases and Elderly Population
+```{r}
+positive_cases <- ggplot(joined_data)+
+  geom_sf(aes(fill=Positive)) + 
+  xlab("Longitude") + ylab("Latitude") +
+  ggtitle("COVID-19 Cases in NYC") + 
+  labs(fill = "COVID Cases") +
+  scale_fill_distiller(palette = "PuRd", direction = 1) +
+  annotation_scale(location = "bl",
+                   width_hint = 0.2) +
+  theme(axis.text.x = element_text(size = 8, angle = 30, hjust = 1))
+
+food_facilities <- ggplot(joined_data) +
+  geom_sf(aes(fill = FOOD_STORE_COUNT)) + 
+  xlab("Longitude") + ylab("Latitude") +
+  ggtitle("Food Facilities in NYC") + 
+  labs(fill = "Food Store Count") +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1) +
+  annotation_scale(location = "bl",
+                   width_hint = 0.2) +
+  theme(axis.text.x = element_text(size = 8, angle = 30, hjust = 1)
+)
+
+positive_cases + food_facilities + plot_layout(ncol = 2, nrow = 1)
+```
+
+## Interactive Map Comparing COVID-19 Cases, Elderly Population and Nursing Homes
+```{r}
+data <- st_transform(joined_data, crs = 4326)
+zip_pts <- st_centroid(data)
+
+pal_fun <- colorNumeric(
+  palette = "YlOrRd",
+  domain = data$Positive,
+  na.color = "transparent",
+  reverse = TRUE)
+
+htmlMap <- leaflet(data) %>%
+  addTiles() %>%
+  
+  # layer 1 covid data
+  addPolygons(
+    stroke = FALSE,
+    fillColor = ~pal_fun(Positive), 
+    fillOpacity = 0.8,
+    smoothFactor = 0.5,
+    popup = ~paste("ZIP Code:", ZIPCODE, "<br>Positive Cases:", Positive),
+    label = ~paste("Positive Cases:", Positive),
+    group = "COVID Cases",
+    highlightOptions = highlightOptions(
+    fillColor = "black",
+    opacity = 1)) %>%
+  
+  # legend 
+  addLegend(position = "bottomright",
+            pal = pal_fun,
+            values = ~Positive,
+            labFormat = function(type, cuts, p) {
+              labels <- prettyNum(cuts, big.mark = ",")
+              return(rev(labels)) 
+              },
+            opacity = 0.8,
+            title = "COVID Cases"
+            )%>%
+  
+  # layer 2 elderly population 
+  addCircleMarkers(
+    data = zip_pts,
+    radius = ~sqrt(elderlyPop) / 11,
+    weight = 1,
+    color = "blue",
+    fillOpacity = 0.4,
+    popup = ~paste("ZIP Code:", ZIPCODE, "<br>Elderly Population:", elderlyPop),
+    label = ~paste("Elderly Population:", elderlyPop),
+    group = "Elderly Population") %>%
+  
+  # layer 3 nursing homes
+  addCircleMarkers(
+    data = zip_pts,
+    radius = ~sqrt(NURSING_HOME_COUNT) * 2,
+    weight = 1,
+    color = "purple",
+    fillOpacity = 0.4,
+    popup = ~paste("ZIP Code:", ZIPCODE, "<br>Nursing Homes:", NURSING_HOME_COUNT),
+    label = ~paste("Nursing Homes:", NURSING_HOME_COUNT),
+    group = "Nursing Homes") %>%
+  
+  addLayersControl(overlayGroups = c("COVID Cases", "Elderly Population", "Nursing Homes"),
+                   options = layersControlOptions(collapsed = FALSE))
+
+htmlMap
+htmlwidgets::saveWidget(htmlMap, "covid_map.html")
+```
+
+## Conclusion
+
+This analysis shows that COVID-19 cases are not evenly spread across New York City and are connected to how crowded an area is and what resources are available there. Areas with higher case counts, especially in parts of Brooklyn and the Bronx, also tend to have more food retail locations, which suggests these areas have more activity and interaction between people.
+
+However, this does not mean that food stores cause higher COVID-19 cases. Instead, both higher case counts and more food locations are likely linked to population density. More crowded areas need more services and also have more movement, which can increase the chance of exposure.
+
+In addition, ZIP codes with more nursing homes often have higher case counts, showing that more vulnerable populations are also affected. Overall, these patterns show that both population characteristics and access to local resources help explain differences in COVID-19 cases across the city.
